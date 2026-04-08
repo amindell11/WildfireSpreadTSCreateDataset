@@ -1,0 +1,8 @@
+cdsapi
+s3fs
+xarray
+netcdf4
+h5netcdf
+numpy
+pyyaml
+tqdm
