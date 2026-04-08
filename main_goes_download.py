@@ -6,22 +6,22 @@ strategy: for each unique date-hour across all fires, downloads one full-disk
 file and crops all active fires from it. This avoids redundant downloads since
 many fires overlap in time (~12 fires per date on average).
 
-Each full-disk file is ~3MB and covers the entire Western Hemisphere.
-1,123 unique dates x 24 hours = ~27K files, ~79GB raw, but streamed and
-discarded after cropping.
+Writes output directly to GCS and checks GCS for existing files to enable
+resume without local storage.
 
-Output structure:
-  {output_dir}/{year}/{fire_name}/{date}.npz
+Output structure (in GCS):
+  gs://{bucket}/{prefix}/{year}/{fire_name}/{date}.npz
   Each file contains:
     'data': (24, 3, H, W) float32 — 3 channels x 24 hours
     'hours': int32 array of hours with valid data
   Channels: Mask (fire confidence), Power (FRP MW), Area (km^2)
 
 Prerequisites:
-  pip install s3fs xarray h5netcdf numpy pyyaml tqdm
+  pip install s3fs xarray h5netcdf numpy pyyaml tqdm google-cloud-storage
 """
 import argparse
 import datetime
+import io
 import os
 import tempfile
 from collections import defaultdict
@@ -32,6 +32,7 @@ import s3fs
 import xarray as xr
 import yaml
 import tqdm
+from google.cloud import storage as gcs_storage
 
 
 S3_BUCKET = 'noaa-goes16'
@@ -60,13 +61,39 @@ def latlon_to_goes_xy(lat, lon):
     return x, y
 
 
-def build_fire_index(configs):
-    """Build mapping from date -> list of (fire_name, year, bbox) that need data.
+def build_existing_set(gcs_bucket, gcs_prefix):
+    """Scan GCS for existing .npz files to skip. Returns set of 'year/fire/date' keys."""
+    client = gcs_storage.Client()
+    bucket = client.bucket(gcs_bucket)
+    existing = set()
+    print(f"Scanning gs://{gcs_bucket}/{gcs_prefix}/ for existing files...")
+    for blob in bucket.list_blobs(prefix=gcs_prefix):
+        if blob.name.endswith('.npz'):
+            # e.g. "WildfireSpreadTS_GOES/2021/fire_123/2021-08-01.npz"
+            parts = blob.name.replace(gcs_prefix + '/', '').split('/')
+            if len(parts) == 3:
+                year, fire_name, fname = parts
+                date_str = fname.replace('.npz', '')
+                existing.add((fire_name, date_str))
+    print(f"  Found {len(existing)} existing files in GCS")
+    return existing
 
-    Returns:
-        date_fires: dict mapping date -> list of (fire_name, year_label,
-                    (x_lo, x_hi, y_lo, y_hi), fire_dir)
-    """
+
+def upload_to_gcs(gcs_bucket, gcs_prefix, year_label, fire_name, date_str, data, hours):
+    """Write npz directly to GCS."""
+    client = gcs_storage.Client()
+    bucket = client.bucket(gcs_bucket)
+    blob_path = f"{gcs_prefix}/{year_label}/{fire_name}/{date_str}.npz"
+    blob = bucket.blob(blob_path)
+
+    buf = io.BytesIO()
+    np.savez_compressed(buf, data=data, hours=hours)
+    buf.seek(0)
+    blob.upload_from_file(buf)
+
+
+def build_fire_index(configs):
+    """Build mapping from date -> list of (fire_name, year, bbox)."""
     date_fires = defaultdict(list)
 
     for config in configs:
@@ -106,21 +133,10 @@ def find_goes_file(fs, year, doy, hour):
         return None
 
 
-def process_one_hour(fs, s3_path, fires_for_date, hour, output_dir):
-    """Download one full-disk file to temp, crop for all fires.
-
-    Downloads to a temp file first, then opens locally for fast partial reads.
-    This is ~2x faster than streaming from S3 with .load().
-
-    Args:
-        fires_for_date: list of (fire_name, year_label, bbox)
-
-    Returns:
-        dict mapping fire_name -> (3, H, W) array for this hour
-    """
+def process_one_hour(fs, s3_path, fires_for_date, hour):
+    """Download one full-disk file to temp, crop for all fires."""
     tmp_path = None
     try:
-        # Download to temp file for fast partial reads
         tmp_fd, tmp_path = tempfile.mkstemp(suffix='.nc')
         os.close(tmp_fd)
         fs.get(s3_path, tmp_path)
@@ -168,8 +184,10 @@ def main():
         description='Download GOES-16 fire data for WildfireSpreadTS fires')
     parser.add_argument('--configs', type=str, nargs='+', required=True,
                         help='Fire config YAMLs (e.g., config/us_fire_2021_1e7.yml)')
-    parser.add_argument('--output_dir', type=str, default='data/goes',
-                        help='Output directory (default: data/goes)')
+    parser.add_argument('--gcs_bucket', type=str, required=True,
+                        help='GCS bucket name for output')
+    parser.add_argument('--gcs_prefix', type=str, default='WildfireSpreadTS_GOES',
+                        help='GCS prefix (default: WildfireSpreadTS_GOES)')
     parser.add_argument('--workers', type=int, default=4,
                         help='Parallel download threads (default: 4)')
     args = parser.parse_args()
@@ -184,28 +202,23 @@ def main():
     # Build index: date -> fires that need GOES data for that date
     print("Building fire date index...")
     date_fires = build_fire_index(configs)
-    print(f"  {len(date_fires)} unique dates, "
-          f"{sum(len(v) for v in date_fires.values())} fire-date pairs")
+    total_pairs = sum(len(v) for v in date_fires.values())
+    print(f"  {len(date_fires)} unique dates, {total_pairs} fire-date pairs")
 
-    # Filter out dates where all fires already have output files
+    # Check GCS for existing files
+    existing = build_existing_set(args.gcs_bucket, args.gcs_prefix)
+
+    # Filter out dates where all fires already have data in GCS
     dates_to_process = []
     for date, fires in sorted(date_fires.items()):
         date_str = date.strftime('%Y-%m-%d')
-        needed = []
-        for fire_name, year_label, bbox in fires:
-            fire_dir = os.path.join(args.output_dir, str(year_label), fire_name)
-            out_path = os.path.join(fire_dir, f'{date_str}.npz')
-            if not os.path.exists(out_path):
-                needed.append((fire_name, year_label, bbox))
+        needed = [(fn, yl, bb) for fn, yl, bb in fires
+                  if (fn, date_str) not in existing]
         if needed:
             dates_to_process.append((date, needed))
 
     print(f"  {len(dates_to_process)} dates need processing "
           f"({len(date_fires) - len(dates_to_process)} already done)")
-
-    # Accumulators: fire_name -> date_str -> {hour: (3, H, W)}
-    fire_hourly = defaultdict(lambda: defaultdict(dict))
-    fire_meta = {}  # fire_name -> year_label
 
     n_workers = args.workers
 
@@ -221,11 +234,10 @@ def main():
                 hour_paths[hour] = s3_path
 
         # Download + crop hours in parallel
-        hour_results = {}  # hour -> {fire_name: (3,H,W)}
+        hour_results = {}
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = {
-                pool.submit(process_one_hour, fs, s3_path, fires, hour,
-                            args.output_dir): hour
+                pool.submit(process_one_hour, fs, s3_path, fires, hour): hour
                 for hour, s3_path in hour_paths.items()
             }
             for future in as_completed(futures):
@@ -235,7 +247,7 @@ def main():
                 except Exception:
                     pass
 
-        # Write per-fire output files for this date
+        # Write per-fire output files directly to GCS
         for fire_name, year_label, bbox in fires:
             hourly = {}
             for hour, results in hour_results.items():
@@ -251,20 +263,17 @@ def main():
                 if data.shape[1:] == spatial_shape:
                     full_day[h] = data
 
-            fire_dir = os.path.join(args.output_dir, str(year_label), fire_name)
-            os.makedirs(fire_dir, exist_ok=True)
-            out_path = os.path.join(fire_dir, f'{date_str}.npz')
-            np.savez_compressed(
-                out_path,
-                data=full_day,
-                hours=np.array(sorted(hourly.keys()), dtype=np.int32),
+            upload_to_gcs(
+                args.gcs_bucket, args.gcs_prefix,
+                year_label, fire_name, date_str,
+                full_day,
+                np.array(sorted(hourly.keys()), dtype=np.int32),
             )
 
     # Summary
-    total_files = 0
-    for root, dirs, files in os.walk(args.output_dir):
-        total_files += sum(1 for f in files if f.endswith('.npz'))
-    print(f"\nDone. {total_files} total GOES day-files in {args.output_dir}")
+    final_existing = build_existing_set(args.gcs_bucket, args.gcs_prefix)
+    print(f"\nDone. {len(final_existing)} total GOES day-files in "
+          f"gs://{args.gcs_bucket}/{args.gcs_prefix}/")
 
 
 if __name__ == '__main__':

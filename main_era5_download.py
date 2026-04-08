@@ -2,10 +2,8 @@
 Download ERA5-Land hourly weather data for WildfireSpreadTS fires.
 
 Uses the Copernicus CDS API to download ERA5-Land hourly data directly,
-bypassing GEE entirely. Much faster than GEE export tasks.
-
-For each fire, downloads all days in a single CDS request (or monthly chunks
-if the date range spans multiple months), then slices into per-day NetCDF files.
+bypassing GEE entirely. Writes output directly to GCS and checks GCS
+for existing files to enable resume without local storage.
 
 Variables (6):
   - 2m_temperature (K)
@@ -15,19 +13,19 @@ Variables (6):
   - total_precipitation (m)
   - surface_pressure (Pa)
 
-Output structure:
-  {output_dir}/{year}/{fire_name}/{date}.nc
-  Each file: (24, 6, lat, lon) — 24 hours, 6 variables, ~10x10 grid cells
+Output structure (in GCS):
+  gs://{bucket}/{prefix}/{year}/{fire_name}/{date}.nc
+  Each file: 6 variables x 24 hours, ~10x10 grid cells
 
 Prerequisites:
-  pip install cdsapi xarray netcdf4
-  Set up ~/.cdsapirc with your CDS credentials:
-    url: https://cds.climate.copernicus.eu/api
-    key: <your-personal-access-token>
+  pip install cdsapi xarray netcdf4 cfgrib eccodes google-cloud-storage
+  Set up ~/.cdsapirc with your CDS credentials
 """
 import argparse
 import datetime
+import io
 import os
+import tempfile
 from collections import defaultdict
 
 import cdsapi
@@ -35,6 +33,7 @@ import numpy as np
 import xarray as xr
 import yaml
 import tqdm
+from google.cloud import storage as gcs_storage
 
 
 CDS_DATASET = 'reanalysis-era5-land'
@@ -66,8 +65,39 @@ def group_dates_by_month(dates):
     return groups
 
 
-def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4):
-    """Download ERA5-Land hourly data for one fire event."""
+def build_existing_set(gcs_bucket, gcs_prefix):
+    """Scan GCS for existing .nc files. Returns set of (fire_name, date_str)."""
+    client = gcs_storage.Client()
+    bucket = client.bucket(gcs_bucket)
+    existing = set()
+    print(f"Scanning gs://{gcs_bucket}/{gcs_prefix}/ for existing files...")
+    for blob in bucket.list_blobs(prefix=gcs_prefix):
+        if blob.name.endswith('.nc'):
+            parts = blob.name.replace(gcs_prefix + '/', '').split('/')
+            if len(parts) == 3:
+                year, fire_name, fname = parts
+                date_str = fname.replace('.nc', '')
+                existing.add((fire_name, date_str))
+    print(f"  Found {len(existing)} existing files in GCS")
+    return existing
+
+
+def upload_nc_to_gcs(gcs_bucket, gcs_prefix, year_label, fire_name, date_str, ds):
+    """Write xarray Dataset as NetCDF directly to GCS."""
+    client = gcs_storage.Client()
+    bucket = client.bucket(gcs_bucket)
+    blob_path = f"{gcs_prefix}/{year_label}/{fire_name}/{date_str}.nc"
+    blob = bucket.blob(blob_path)
+
+    buf = io.BytesIO()
+    ds.to_netcdf(buf)
+    buf.seek(0)
+    blob.upload_from_file(buf)
+
+
+def download_era5_for_fire(client, config, fire_name, gcs_bucket, gcs_prefix,
+                           existing_set, buffer_days=4):
+    """Download ERA5-Land hourly data for one fire event, upload to GCS."""
     loc = config[fire_name]
     lat = loc['latitude']
     lon = loc['longitude']
@@ -76,18 +106,11 @@ def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4)
     rect_size = config.get('rectangular_size', 0.5)
     year = config.get('year', start.year)
 
-    fire_dir = os.path.join(output_dir, str(year), fire_name)
-    os.makedirs(fire_dir, exist_ok=True)
-
     dates = get_date_range(start, end, buffer_days)
 
-    # Check which dates are already downloaded
-    existing = set()
-    for d in dates:
-        nc_path = os.path.join(fire_dir, f'{d.strftime("%Y-%m-%d")}.nc')
-        if os.path.exists(nc_path):
-            existing.add(d)
-    dates = [d for d in dates if d not in existing]
+    # Filter out dates already in GCS
+    dates = [d for d in dates
+             if (fire_name, d.strftime('%Y-%m-%d')) not in existing_set]
     if not dates:
         return 0
 
@@ -106,7 +129,8 @@ def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4)
     for (yr, mo), month_dates in sorted(monthly.items()):
         day_list = sorted(set(d.day for d in month_dates))
 
-        tmp_file = os.path.join(fire_dir, f'_tmp_{yr}_{mo:02d}')
+        tmp_fd, tmp_file = tempfile.mkstemp(suffix='.grib')
+        os.close(tmp_fd)
 
         try:
             client.retrieve(
@@ -129,45 +153,30 @@ def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4)
                 os.remove(tmp_file)
             continue
 
-        # Detect actual format and open
         try:
-            # Check file header to detect format
+            # Detect format from header
             with open(tmp_file, 'rb') as fh:
                 header = fh.read(8)
-            fsize = os.path.getsize(tmp_file)
-            print(f"    Downloaded {fsize/1024:.0f}KB, header: {header[:4]}")
 
-            # ZIP archive (PK header)
-            if header[:2] == b'PK':
+            if header[:4] == b'GRIB':
+                ds = xr.open_dataset(tmp_file, engine='cfgrib')
+            elif header[:4] == b'\x89HDF':
+                ds = xr.open_dataset(tmp_file, engine='h5netcdf')
+            elif header[:3] == b'CDF':
+                ds = xr.open_dataset(tmp_file, engine='netcdf4')
+            elif header[:2] == b'PK':
                 import zipfile
-                extract_dir = tmp_file + '_extracted'
+                extract_dir = tmp_file + '_ext'
                 os.makedirs(extract_dir, exist_ok=True)
                 with zipfile.ZipFile(tmp_file, 'r') as zf:
                     zf.extractall(extract_dir)
-                nc_files = [os.path.join(extract_dir, f) for f in os.listdir(extract_dir)
-                            if f.endswith('.nc') or f.endswith('.netcdf')]
-                if nc_files:
-                    tmp_file = nc_files[0]
-                    print(f"    Extracted: {os.path.basename(tmp_file)}")
-
-            # GRIB (GRIB header)
-            if header[:4] == b'GRIB':
-                ds = xr.open_dataset(tmp_file, engine='cfgrib')
-            # HDF5/NetCDF4 (\x89HDF header)
-            elif header[:4] == b'\x89HDF':
-                ds = xr.open_dataset(tmp_file, engine='h5netcdf')
-            # NetCDF3 (CDF header)
-            elif header[:3] == b'CDF':
-                ds = xr.open_dataset(tmp_file, engine='netcdf4')
+                nc_files = [os.path.join(extract_dir, f)
+                            for f in os.listdir(extract_dir)
+                            if f.endswith('.nc')]
+                ds = xr.open_dataset(nc_files[0])
             else:
-                # Try all engines
-                try:
-                    ds = xr.open_dataset(tmp_file, engine='netcdf4')
-                except Exception:
-                    try:
-                        ds = xr.open_dataset(tmp_file, engine='h5netcdf')
-                    except Exception:
-                        ds = xr.open_dataset(tmp_file, engine='cfgrib')
+                ds = xr.open_dataset(tmp_file)
+
             # cfgrib uses 'valid_time' instead of 'time'
             time_dim = 'valid_time' if 'valid_time' in ds.dims else 'time'
 
@@ -175,11 +184,10 @@ def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4)
                 day_str = d.strftime('%Y-%m-%d')
                 day_data = ds.sel({time_dim: day_str})
 
-                # Verify we got 24 hours
                 n_times = day_data.sizes.get(time_dim, 0)
                 if n_times >= 1:
-                    out_path = os.path.join(fire_dir, f'{day_str}.nc')
-                    day_data.to_netcdf(out_path)
+                    upload_nc_to_gcs(gcs_bucket, gcs_prefix, year,
+                                     fire_name, day_str, day_data)
                     n_downloaded += 1
 
             ds.close()
@@ -188,6 +196,11 @@ def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4)
         finally:
             if os.path.exists(tmp_file):
                 os.remove(tmp_file)
+            # Clean up extract dir if it exists
+            extract_dir = tmp_file + '_ext'
+            if os.path.exists(extract_dir):
+                import shutil
+                shutil.rmtree(extract_dir, ignore_errors=True)
 
     return n_downloaded
 
@@ -197,8 +210,10 @@ def main():
         description='Download ERA5-Land hourly data for WildfireSpreadTS fires')
     parser.add_argument('--config', type=str, required=True,
                         help='Fire config YAML (e.g., config/us_fire_2021_1e7.yml)')
-    parser.add_argument('--output_dir', type=str, default='data/era5',
-                        help='Output directory (default: data/era5)')
+    parser.add_argument('--gcs_bucket', type=str, required=True,
+                        help='GCS bucket name for output')
+    parser.add_argument('--gcs_prefix', type=str, default='WildfireSpreadTS_ERA5',
+                        help='GCS prefix (default: WildfireSpreadTS_ERA5)')
     parser.add_argument('--buffer_days', type=int, default=4,
                         help='Days before/after fire dates (default: 4)')
     parser.add_argument('--skip_fires', type=int, default=0,
@@ -210,7 +225,10 @@ def main():
     with open(args.config, 'r', encoding='utf8') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
 
-    client = cdsapi.Client()
+    cds_client = cdsapi.Client()
+
+    # Check GCS for existing files
+    existing = build_existing_set(args.gcs_bucket, args.gcs_prefix)
 
     metadata_keys = {'output_bucket', 'rectangular_size', 'year'}
     fire_names = [k for k in config.keys() if k not in metadata_keys]
@@ -222,8 +240,9 @@ def main():
     for fire_name in tqdm.tqdm(fire_names, desc='Downloading ERA5'):
         try:
             n = download_era5_for_fire(
-                client, config, fire_name, args.output_dir,
-                buffer_days=args.buffer_days,
+                cds_client, config, fire_name,
+                args.gcs_bucket, args.gcs_prefix,
+                existing, buffer_days=args.buffer_days,
             )
             total_downloaded += n
             if n > 0:
@@ -231,7 +250,8 @@ def main():
         except Exception as e:
             tqdm.tqdm.write(f"  {fire_name}: FAILED - {e}")
 
-    print(f"\nDone. Downloaded {total_downloaded} day-files.")
+    print(f"\nDone. Downloaded {total_downloaded} day-files to "
+          f"gs://{args.gcs_bucket}/{args.gcs_prefix}/")
 
 
 if __name__ == '__main__':
