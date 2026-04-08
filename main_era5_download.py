@@ -168,19 +168,16 @@ def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4)
                         ds = xr.open_dataset(tmp_file, engine='h5netcdf')
                     except Exception:
                         ds = xr.open_dataset(tmp_file, engine='cfgrib')
+            # cfgrib uses 'valid_time' instead of 'time'
+            time_dim = 'valid_time' if 'valid_time' in ds.dims else 'time'
+
             for d in month_dates:
                 day_str = d.strftime('%Y-%m-%d')
-                day_data = ds.sel(time=day_str)
+                day_data = ds.sel({time_dim: day_str})
 
                 # Verify we got 24 hours
-                if 'time' in day_data.dims and day_data.sizes['time'] == 24:
-                    out_path = os.path.join(fire_dir, f'{day_str}.nc')
-                    day_data.to_netcdf(out_path)
-                    n_downloaded += 1
-                elif 'time' not in day_data.dims:
-                    # Single timestep selected, might happen at boundaries
-                    pass
-                else:
+                n_times = day_data.sizes.get(time_dim, 0)
+                if n_times >= 1:
                     out_path = os.path.join(fire_dir, f'{day_str}.nc')
                     day_data.to_netcdf(out_path)
                     n_downloaded += 1
