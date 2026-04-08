@@ -106,7 +106,7 @@ def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4)
     for (yr, mo), month_dates in sorted(monthly.items()):
         day_list = sorted(set(d.day for d in month_dates))
 
-        tmp_file = os.path.join(fire_dir, f'_tmp_{yr}_{mo:02d}.nc')
+        tmp_file = os.path.join(fire_dir, f'_tmp_{yr}_{mo:02d}')
 
         try:
             client.retrieve(
@@ -119,6 +119,7 @@ def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4)
                     'time': ALL_HOURS,
                     'area': area,
                     'data_format': 'netcdf',
+                    'download_format': 'unarchived',
                 },
                 tmp_file,
             )
@@ -128,9 +129,45 @@ def download_era5_for_fire(client, config, fire_name, output_dir, buffer_days=4)
                 os.remove(tmp_file)
             continue
 
-        # Split into per-day files
+        # Detect actual format and open
         try:
-            ds = xr.open_dataset(tmp_file)
+            # Check file header to detect format
+            with open(tmp_file, 'rb') as fh:
+                header = fh.read(8)
+            fsize = os.path.getsize(tmp_file)
+            print(f"    Downloaded {fsize/1024:.0f}KB, header: {header[:4]}")
+
+            # ZIP archive (PK header)
+            if header[:2] == b'PK':
+                import zipfile
+                extract_dir = tmp_file + '_extracted'
+                os.makedirs(extract_dir, exist_ok=True)
+                with zipfile.ZipFile(tmp_file, 'r') as zf:
+                    zf.extractall(extract_dir)
+                nc_files = [os.path.join(extract_dir, f) for f in os.listdir(extract_dir)
+                            if f.endswith('.nc') or f.endswith('.netcdf')]
+                if nc_files:
+                    tmp_file = nc_files[0]
+                    print(f"    Extracted: {os.path.basename(tmp_file)}")
+
+            # GRIB (GRIB header)
+            if header[:4] == b'GRIB':
+                ds = xr.open_dataset(tmp_file, engine='cfgrib')
+            # HDF5/NetCDF4 (\x89HDF header)
+            elif header[:4] == b'\x89HDF':
+                ds = xr.open_dataset(tmp_file, engine='h5netcdf')
+            # NetCDF3 (CDF header)
+            elif header[:3] == b'CDF':
+                ds = xr.open_dataset(tmp_file, engine='netcdf4')
+            else:
+                # Try all engines
+                try:
+                    ds = xr.open_dataset(tmp_file, engine='netcdf4')
+                except Exception:
+                    try:
+                        ds = xr.open_dataset(tmp_file, engine='h5netcdf')
+                    except Exception:
+                        ds = xr.open_dataset(tmp_file, engine='cfgrib')
             for d in month_dates:
                 day_str = d.strftime('%Y-%m-%d')
                 day_data = ds.sel(time=day_str)
